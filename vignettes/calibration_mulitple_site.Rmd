@@ -1,3 +1,12 @@
+
+---
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{P-model usage}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\usepackage[utf8]{inputenc}
+---
+
 ```{r}
 # library and data loading
 library(rsofun)
@@ -7,9 +16,128 @@ library(ggplot2)
 library(readr)
 library(cowplot)
 
-driver <- read_rds("/data_2/FluxDataKit/v3.4/zenodo_upload/rsofun_driver_data_v3.4.rds") # currently only on workstation
 
+plot_eval <- function(df, is_gpp = TRUE, return_gg1 = FALSE, return_gg2 = FALSE){
+  
+  use_col <- ifelse(is_gpp, "tomato", "royalblue")
+  use_lab <- ifelse(
+    is_gpp,
+    expression(paste("GPP (g C m"^-2, "s"^-1, ")")), 
+    expression(paste("LE (W m"^-2, ")"))
+    )
+  use_lab_obs <- ifelse(
+    is_gpp,
+    expression(paste("Observed GPP (g C m"^-2, "s"^-1, ")")), 
+    expression(paste("Observed LE (W m"^-2, ")"))
+    )
+  use_lab_mod <- ifelse(
+    is_gpp,
+    expression(paste("Modeled GPP (g C m"^-2, "s"^-1, ")")), 
+    expression(paste("Modeled LE (W m"^-2, ")"))
+    )
+  lims <- ifelse(
+    is_gpp,
+    c(-0.5, 10),
+    c(-20, 175)
+  )
+   
+  # Plot GPP observed and modelled quartiles by day-of-year
+  gg1 <- df |> 
+    tidyr::pivot_longer(c(mod, obs), names_to = "type", values_to = "var") |> 
+    mutate(doy = lubridate::yday(date)) |> 
+    group_by(doy, type) |> 
+    summarise(
+      var_q25 = quantile(var, probs = c(0.25), na.rm = TRUE),
+      var_q75 = quantile(var, probs = c(0.75), na.rm = TRUE)
+      ) |> 
+    ggplot() +
+    geom_ribbon(
+      aes(
+        x = doy,
+        ymin = var_q25,
+        ymax = var_q75,
+        fill = type
+        ),
+      alpha = 0.75
+    ) +
+    scale_fill_manual(
+      name = "",
+      values = c(
+        "mod" = use_col,
+        "obs" = 'grey20'
+        ),
+      labels = c(
+        "mod" = "Mod.",
+        "obs" = "Obs."
+      )) +
+    theme_classic() +
+    theme() +
+    labs(
+      x = 'Date',
+      y = use_lab,
+      colour = ""
+    )
+  
+  # get fit metrics
+  rsq_val <- yardstick::rsq(df, mod, obs) |> pull(.estimate)
+  rmse_val <- yardstick::rmse(df, mod, obs) |> pull(.estimate)
+  bias_val <- mean(df$mod - df$obs, na.rm = TRUE)
+  linmod <- lm(obs ~ mod + 0, data = df)
+  slope_val <- coef(linmod)
+  n_val <- df |> tidyr::drop_na() |> nrow()
+  
+  rsq_lab <- format(rsq_val, digits = 3)
+  rmse_lab <- format(rmse_val, digits = 3)
+  bias_lab <- format(bias_val, digits = 3)
+  slope_lab <- format(slope_val, digits = 3)
+  n_lab <- n_val
+  
+  subtitle <- bquote(italic(R)^2 == .(rsq_lab) ~ ~
+                    RMSE == .(rmse_lab) ~ ~
+                    bias == .(bias_lab) ~ ~
+                    slope == .(slope_lab) ~ ~
+                    italic(N) == .(n_lab))
+  
+  # plot modelled vs. observed (actually the reverse)
+  gg2 <- df |> 
+    ggplot(aes(x = mod, y = obs)) +
+    geom_hex(bins = 50, show.legend = FALSE) +
+    theme_classic() +
+    geom_abline(intercept = 0, slope = 1, linetype = "dotted") +
+    geom_hline(yintercept = 0, linetype = "dotted") +
+    geom_vline(xintercept = 0, linetype = "dotted")+ 
+    geom_smooth(method = "lm", formula = y ~ x + 0, color = "red", size = 0.5, se = FALSE) +
+    xlim(lims[1], lims[2]) + 
+    ylim(lims[1], lims[2]) +
+    labs(
+      x = use_lab_mod,
+      y = use_lab_obs,
+      subtitle = subtitle
+    )
+  
+  if (is_gpp){
+    gg2 <- gg2 +
+      khroma::scale_fill_batlowW(trans = "log", reverse = TRUE)
+  } else {
+    gg2 <- gg2 +
+      khroma::scale_fill_davos(trans = "log", reverse = TRUE)
+
+  }
+  
+  if (return_gg1){
+    return(gg1)
+  } else if (return_gg2){
+    return(gg2)
+  } else {
+    cow <- cowplot::plot_grid(gg1, gg2, nrow = 1)
+    return(cow)
+  }
+}
 ```
+
+## Scope
+
+In this Vignette I'll modified the cost function used in 'calib_sofun' to calibrate the parameters using only the daily gpp and le value with a quality flag higher than 0.8. each modification of the original function are indicated with the comment "MODIFIED"
 
 ```{r}
 modified_cost_likelihood_pmodel <- function(
@@ -176,12 +304,16 @@ modified_cost_likelihood_pmodel <- function(
 
 ```
 
+## Site selection
+
+I select the climate Csb because there are only 8 sites (4 for train and 4 for test)
+
 ```{r}
 # quality check if the site have at least some days with high quality gpp AND le data
 
+driver <- read_rds("/data_2/FluxDataKit/v3.4/zenodo_upload/rsofun_driver_data_v3.4.rds") # currently only on workstation
+
 fdk_full <- read_csv("/data_2/FluxDataKit/v3.4/zenodo_upload/fdk_site_fullyearsequence.csv")
-
-
 
 fdk_full <- fdk_full |> filter(drop_gpp == F, drop_le == F)
 
@@ -195,7 +327,7 @@ table(tolower(fdk_site_info$koeppen_code))
 
 # I use the basyien tools as in the previous step
 
-fdk_site_info <- fdk_site_info[tolower(fdk_site_info$koeppen_code) == "dfc",]
+fdk_site_info <- fdk_site_info[tolower(fdk_site_info$koeppen_code) == "csb",]
 
 driver <- driver[driver$sitename %in% fdk_site_info$sitename,]
 
@@ -211,11 +343,17 @@ for(i in 1:dim(driver[1])){
   driver$site_info[[i]]$reference_height <- fdk_site_info$reference_height[i]
 }
 
-train <- driver[1:12,]
+train <- driver[1:3,]
 
 
+# I remove the site US-Me3 because don't have le measurment
+
+driver <- driver[!(driver$sitename == "US-Me3"),]
+driver <- driver[!(driver$sitename == "US-Me6"),]
 
 ```
+
+## Run with non calibrated parameter
 
 ```{r}
 params_modl <- list(
@@ -229,52 +367,49 @@ params_modl <- list(
   kc_jmax            = 0.41
 )
 
-out_non_calibrated <- runread_pmodel_f(
-  driver[13:24,],
+output <- runread_pmodel_f(
+  driver[4:6,],
   par = params_modl
 )
 
-for(i in 1:12){
-  plot_non_calibrated <- driver[12+i,] |> unnest(forcing) |>
-    select(date,gpp,le) |>
-    rename(gpp_obs = gpp,
-           le_obs = le)
-  
-  plot_non_calibrated$gpp_pred <- out_non_calibrated[[3]][[i]]$gpp
-  plot_non_calibrated$le_pred <- out_non_calibrated[[3]][[i]]$le / (24*60*60)
-  
-  plot_non_calibrated_gpp <- ggplot(plot_non_calibrated) +
-  geom_line(aes(x=date,y=gpp_obs,color="obs",alpha =0.5)) +
-  geom_line(aes(x=date,y=gpp_pred,color="pred",alpha =0.5)) +
-  theme(legend.position = "none")
-  
-  plot_non_calibrated_le <- ggplot(plot_non_calibrated) +
-  geom_line(aes(x=date,y=le_obs,color="obs",alpha =0.5)) +
-  geom_line(aes(x=date,y=le_pred,color="pred",alpha =0.5)) +
-  theme(legend.position = "none")
-  
-  assign(paste0("plot_gpp_",i),plot_non_calibrated_gpp)
-  
-  assign(paste0("plot_le_",i),plot_non_calibrated_le)
+
+for(i in 1:3){
+  df_plot <- output[i,] |>
+  unnest(data) |>
+  select(date, mod = gpp) |> 
+  left_join(
+    driver[i+3,] |>
+      unnest(forcing) |> 
+      select(date, obs = gpp),
+    by = join_by(date)
+  )
+
+  print(plot_eval(df_plot))
 }
-
 ```
+
+### LE plot
 
 ```{r}
-# GPP plot
+# LE plot
+for(i in 1:3){
+  df_plot <- output |>
+  unnest(data) |>
+  mutate(le =  le / (24 * 60 * 60)) |> 
+  select(date, mod = le) |> 
+  left_join(
+     driver[i+3,] |>
+      unnest(forcing) |> 
+      select(date, obs = le),
+    by = join_by(date)
+  )
 
-plot_list <- mget(ls(pattern = "^plot_gpp_"))
-
-plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
+  print(plot_eval(df_plot, is_gpp = F))
+}
 ```
 
-```{r}
-# le plot
 
-plot_list <- mget(ls(pattern = "^plot_le_"))
-
-plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
-```
+## LE and GPP calibration
 
 
 ```{r}
@@ -307,9 +442,9 @@ settings <- list(
   control = list(
     sampler = "DEzs",
     settings = list(
-      nrChains = 10,
+      nrChains = 15,
       burnin = 0,
-      iterations = 250    # kept artificially low,
+      iterations = 1000    # kept artificially low,
     )
   )
 )
@@ -337,48 +472,45 @@ params_modl <- list(
   kc_jmax            = 0.54131889
 )
 
-out_calibrated <- runread_pmodel_f(
-  driver[13:24,],
+output <- runread_pmodel_f(
+  driver[4:6,],
   par = params_modl
 )
 
-for(i in 1:12){
-  plot_calibrated <- driver[12+i,] |> unnest(forcing) |>
-    select(date,gpp,le) |>
-    rename(gpp_obs = gpp,
-           le_obs = le)
-  
-  plot_calibrated$gpp_pred <- out_calibrated[[3]][[i]]$gpp
-  plot_calibrated$le_pred <- out_calibrated[[3]][[i]]$le / (24*60*60)
-  
-  plot_calibrated_gpp <- ggplot(plot_calibrated) +
-  geom_line(aes(x=date,y=gpp_obs,color="obs",alpha =0.5)) +
-  geom_line(aes(x=date,y=gpp_pred,color="pred",alpha =0.5)) +
-  theme(legend.position = "none")
-  
-  plot_calibrated_le <- ggplot(plot_calibrated) +
-  geom_line(aes(x=date,y=le_obs,color="obs",alpha =0.5)) +
-  geom_line(aes(x=date,y=le_pred,color="pred",alpha =0.5)) +
-  theme(legend.position = "none")
-  
-  assign(paste0("plot_gpp_",i),plot_calibrated_gpp)
-  
-  assign(paste0("plot_le_",i),plot_calibrated_le)
+
+for(i in 1:3){
+  df_plot <- output[i,] |>
+  unnest(data) |>
+  select(date, mod = gpp) |> 
+  left_join(
+    driver[i+3,] |>
+      unnest(forcing) |> 
+      select(date, obs = gpp),
+    by = join_by(date)
+  )
+
+  print(plot_eval(df_plot))
 }
 ```
 
+### LE plot
+
 ```{r}
 # GPP plot
+for(i in 1:3){
+  df_plot <- output[i,] |>
+  unnest(data) |>
+  mutate(le =  le / (24 * 60 * 60)) |> 
+  select(date, mod = le) |> 
+  left_join(
+    driver[i+3,] |>
+      unnest(forcing) |> 
+      select(date, obs = le),
+    by = join_by(date)
+  )
 
-plot_list <- mget(ls(pattern = "^plot_gpp_"))
-
-plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
+  print(plot_eval(df_plot, is_gpp = F))
+}
 ```
 
-```{r}
-# le plot
-
-plot_list <- mget(ls(pattern = "^plot_le_"))
-
-plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
-```
+The calibratoin improves the LE estimation while decrease the GPP prediction
