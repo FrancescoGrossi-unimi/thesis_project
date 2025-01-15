@@ -1,0 +1,384 @@
+```{r}
+# library and data loading
+library(rsofun)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(cowplot)
+
+driver <- read_rds("/data_2/FluxDataKit/v3.4/zenodo_upload/rsofun_driver_data_v3.4.rds") # currently only on workstation
+
+```
+
+```{r}
+modified_cost_likelihood_pmodel <- function(
+    par,   # model parameters & error terms for each target
+    obs,
+    drivers,
+    targets,
+    par_fixed = NULL,   # non-calibrated model parameters
+    parallel = FALSE,
+    ncores = 2
+){
+  # NOTE(fabian): These different cost functions share a LOT of code in common. Consider consolidation for maintainability?
+  
+  # predefine variables for CRAN check compliance
+  sitename <- data <- gpp_mod <- NULL
+  
+  if (!("use_phydro" %in% colnames(drivers$params_siml[[1]]))){
+    warning("Parameter use_phydro not set. Assuming FALSE")
+    using_phydro = FALSE
+  } else {
+    using_phydro = drivers$params_siml[[1]]$use_phydro
+  }
+  
+  ## define required parameter set based on model parameters
+  if (!using_phydro){
+    required_param_names <- rsofun:::required_param_names$p_model
+  } else {
+    required_param_names <- rsofun:::required_param_names$phydro_model
+  }
+  
+  ## split calibrated parameters into model and error parameters
+  par_calibrated_model      <- par[!startsWith(names(par), "err_")] # consider only model parameters for the check
+  # par_calibrated_errormodel <- par[   names(par) %in% c("err_gpp", "err_vcmax25") ]
+  # par_fixed
+  
+  ## check parameters
+  if (!identical(sort(c(names(par_calibrated_model), names(par_fixed))), required_param_names)){
+    stop(sprintf(paste0("Error: Input calibratable and fixed parameters do not ",
+                        "match required model parameters:",
+                        "\n         par:       c(%s)",
+                        "\n         par_fixed: c(%s)",
+                        "\n         required:  c(%s)"),
+                 paste0(sort(names(par_calibrated_model)), collapse = ", "),
+                 paste0(sort(names(par_fixed)), collapse = ", "),
+                 paste0(sort(required_param_names), collapse = ", ")))
+  }
+  
+  # Combine fixed and estimated params to result in all the params required to run the model
+  # This basically uses all params except those of the error model of the observations
+  params_modl <- c(par, par_fixed)[required_param_names]
+  
+  ## run the model
+  df <- runread_pmodel_f(
+    drivers,
+    par = params_modl,
+    makecheck = TRUE,
+    parallel = parallel,
+    ncores = ncores
+  )
+  
+  ## clean model output and unnest
+  df <- df |>
+    dplyr::rowwise() |>
+    dplyr::reframe(
+      cbind(sitename, data[, c('date', unique(c('gpp', targets)))]) |>
+        stats::setNames(c('sitename', 'date', paste0(unique(c('gpp', targets)), '_mod')))
+    ) # gpp is used to get average trait prediction
+  
+  # separate validation data into fluxes and traits, site by site
+  is_flux <- apply(obs, 1, function(x){ 'date' %in% colnames(x$data)})
+  
+  if(sum(is_flux) > 0){
+    flux_sites <- obs$sitename[is_flux]
+    
+    # Unnest flux observations for our targets
+    obs_flux <- obs[is_flux, ] |>
+      dplyr::select(sitename, data) |>
+      tidyr::unnest(data) |>
+      dplyr::select(any_of(c('sitename', 'date', targets,paste0(targets,"_qc"))))
+    
+    if(ncol(obs_flux) < 3){
+      warning("Dated observations (fluxes) are missing for the chosen targets.")
+      df_flux <- data.frame()
+    }else{
+      # Join P-model output and flux observations
+      df_flux <- df |>
+        dplyr::filter(sitename %in% flux_sites) |>
+        dplyr::left_join(
+          obs_flux, 
+          by = c('sitename', 'date'))    # observations with missing date are ignored
+    }
+  }else{
+    df_flux <- data.frame()
+  }
+  
+  if(sum(!is_flux) > 0){
+    trait_sites <- obs$sitename[!is_flux]
+    
+    # Unnest trait observations for our targets
+    obs_trait <- obs[!is_flux, ] |>
+      dplyr::select(sitename, data) |>
+      tidyr::unnest(data) |>
+      dplyr::select(any_of(c('sitename', targets,paste0(targets,"_qc"))))
+    
+    if(ncol(obs_trait) < 2){
+      warning("Non-dated observations (traits) are missing for the chosen targets.")
+      df_trait <- data.frame()
+    }else{
+      # Join output and trait observations
+      df_trait <- df |>
+        dplyr::filter(sitename %in% trait_sites) |>
+        dplyr::group_by(sitename) |>
+        # get growing season average traits
+        dplyr::summarise(across(ends_with("_mod") & !starts_with('gpp'),
+                                ~ sum(.x * gpp_mod/sum(gpp_mod)),
+                                .names = "{.col}")) |>
+        dplyr::left_join(
+          obs_trait,
+          by = c('sitename')        # compare yearly averages rather than daily obs
+        )
+    }
+  }else{
+    df_trait <- data.frame()
+  }
+  
+  # loop over targets to compute log-likelihood ll
+  ll_df <- data.frame(target = targets, 
+                      ll     = NaN)
+  for (target in targets){
+    # check (needed?):
+    if(target %in% colnames(df_flux) & target %in% colnames(df_trait)) {stop(
+      sprintf("Target '%s' cannot be simultatneously in df_flux and df_trait.", target))
+    }
+    
+    # get observations and predicted target values, without NA 
+    df_target <- if(target %in% colnames(df_flux)){
+      df_flux[, c(paste0(target, '_mod'), target ,paste0(target, '_qc'))] |> tidyr::drop_na()
+    }else{
+      df_trait[, c(paste0(target, '_mod'), target, paste0(target, '_qc'))] |> tidyr::drop_na()
+    }
+    
+    # le in the output is on d^-1 while in input is in s^-1
+    if(target == "le"){
+      df_target$le_mod <- df_target$le_mod / (24*60*60)
+    }
+    
+    df_target <- df_target |> filter(if_all(ends_with("_qc"), ~ . > 0.8))
+    
+    # calculate normal log-likelihood
+    ll_df[ll_df$target == target, 'll'] <- 
+      sum(stats::dnorm(
+        x    = df_target[[paste0(target, '_mod')]], # model
+        mean = df_target[[target]],                 # obs
+        sd   = par[[paste0('err_', target)]],       # error model
+        log  = TRUE))
+  }
+  ll <- sum(ll_df$ll)
+  
+  # trap boundary conditions
+  if(is.nan(ll) | is.na(ll) | ll == 0){ll <- -Inf}
+  
+  return(ll)
+}
+
+```
+
+```{r}
+# quality check if the site have at least some days with high quality gpp AND le data
+
+fdk_full <- read_csv("/data_2/FluxDataKit/v3.4/zenodo_upload/fdk_site_fullyearsequence.csv")
+
+
+
+fdk_full <- fdk_full |> filter(drop_gpp == F, drop_le == F)
+
+fdk_site_info <- read_csv("/data_2/FluxDataKit/v3.4/zenodo_upload/fdk_site_info.csv")
+
+fdk_site_info <-fdk_site_info[fdk_site_info$sitename %in% fdk_full$sitename,]
+
+table(tolower(fdk_site_info$koeppen_code))
+
+# I select the climate dfc
+
+# I use the basyien tools as in the previous step
+
+fdk_site_info <- fdk_site_info[tolower(fdk_site_info$koeppen_code) == "dfc",]
+
+driver <- driver[driver$sitename %in% fdk_site_info$sitename,]
+
+for(i in 1:dim(driver[1])){
+  
+  driver$params_siml[[i]]$use_gs     <- TRUE
+  driver$params_siml[[i]]$use_pml    <- TRUE
+  driver$params_siml[[i]]$use_phydro <- FALSE
+  
+  driver$forcing_acclim[[i]] <- driver$forcing[[i]]
+
+  driver$site_info[[i]]$canopy_height    <- fdk_site_info$canopy_height[i]
+  driver$site_info[[i]]$reference_height <- fdk_site_info$reference_height[i]
+}
+
+train <- driver[1:12,]
+
+
+
+```
+
+```{r}
+params_modl <- list(
+  kphio              = 0.04998,    # setup ORG in Stocker et al. 2020 GMD
+  kphio_par_a        = 0.0,        # set to zero to disable temperature-dependence of kphio
+  kphio_par_b        = 1.0,
+  soilm_thetastar    = 0.6 * 240,  # to recover old setup with soil moisture stress
+  beta_unitcostratio = 146.0,
+  rd_to_vcmax        = 0.014,      # value from Atkin et al. 2015 for C3 herbaceous
+  tau_acclim         = 30.0,
+  kc_jmax            = 0.41
+)
+
+out_non_calibrated <- runread_pmodel_f(
+  driver[13:24,],
+  par = params_modl
+)
+
+for(i in 1:12){
+  plot_non_calibrated <- driver[12+i,] |> unnest(forcing) |>
+    select(date,gpp,le) |>
+    rename(gpp_obs = gpp,
+           le_obs = le)
+  
+  plot_non_calibrated$gpp_pred <- out_non_calibrated[[3]][[i]]$gpp
+  plot_non_calibrated$le_pred <- out_non_calibrated[[3]][[i]]$le / (24*60*60)
+  
+  plot_non_calibrated_gpp <- ggplot(plot_non_calibrated) +
+  geom_line(aes(x=date,y=gpp_obs,color="obs",alpha =0.5)) +
+  geom_line(aes(x=date,y=gpp_pred,color="pred",alpha =0.5)) +
+  theme(legend.position = "none")
+  
+  plot_non_calibrated_le <- ggplot(plot_non_calibrated) +
+  geom_line(aes(x=date,y=le_obs,color="obs",alpha =0.5)) +
+  geom_line(aes(x=date,y=le_pred,color="pred",alpha =0.5)) +
+  theme(legend.position = "none")
+  
+  assign(paste0("plot_gpp_",i),plot_non_calibrated_gpp)
+  
+  assign(paste0("plot_le_",i),plot_non_calibrated_le)
+}
+
+```
+
+```{r}
+# GPP plot
+
+plot_list <- mget(ls(pattern = "^plot_gpp_"))
+
+plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
+```
+
+```{r}
+# le plot
+
+plot_list <- mget(ls(pattern = "^plot_le_"))
+
+plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
+```
+
+
+```{r}
+# LE and GPP calibration
+
+evaluation <- train |>
+  unnest(forcing) |>
+  select(sitename,date,gpp,gpp_qc,le,le_qc) |>
+  group_by(sitename) |>
+  nest(data = c(date,gpp,gpp_qc,le,le_qc))
+
+params_fix <- list(
+  beta_unitcostratio = 146,
+  rd_to_vcmax        = 0.014,
+  tau_acclim         = 30,
+  kc_jmax            = 0.41)
+
+# Define calibration settings
+settings <- list(
+  method = "BayesianTools",
+  par = list(
+    kphio = list(lower=0.03, upper=0.2, init = 0.05),
+    kphio_par_a = list(lower = -0.0004, upper = 0.001, init = -0.0025),
+    kphio_par_b = list(lower = 10, upper = 30, init = 20),
+    soilm_thetastar = list(lower  = 0, upper = 240, init = 144),
+    err_gpp = list(lower = 0.01, upper = 4, init = 2),
+    err_le = list(lower = 0.01, upper = 170, init = 38)
+  ),
+  metric = modified_cost_likelihood_pmodel,
+  control = list(
+    sampler = "DEzs",
+    settings = list(
+      nrChains = 10,
+      burnin = 0,
+      iterations = 250    # kept artificially low,
+    )
+  )
+)
+
+# Run the calibration for GPP data
+calib_output <- rsofun::calib_sofun(
+  drivers = train,
+  obs = evaluation,
+  settings = settings,
+  # extra arguments for the cost function
+  par_fixed = params_fix,
+  targets = c("gpp","le")
+)
+```
+
+```{r}
+params_modl <- list(
+  kphio              = calib_output$par[["kphio"]],   
+  kphio_par_a        = calib_output$par[["kphio_par_a"]],       
+  kphio_par_b        = calib_output$par[["kphio_par_b"]],
+  rd_to_vcmax        = 0.014,  
+  soilm_thetastar    =  calib_output$par[["soilm_thetastar"]], 
+  beta_unitcostratio = 146,
+  tau_acclim         = 30,
+  kc_jmax            = 0.54131889
+)
+
+out_calibrated <- runread_pmodel_f(
+  driver[13:24,],
+  par = params_modl
+)
+
+for(i in 1:12){
+  plot_calibrated <- driver[12+i,] |> unnest(forcing) |>
+    select(date,gpp,le) |>
+    rename(gpp_obs = gpp,
+           le_obs = le)
+  
+  plot_calibrated$gpp_pred <- out_calibrated[[3]][[i]]$gpp
+  plot_calibrated$le_pred <- out_calibrated[[3]][[i]]$le / (24*60*60)
+  
+  plot_calibrated_gpp <- ggplot(plot_calibrated) +
+  geom_line(aes(x=date,y=gpp_obs,color="obs",alpha =0.5)) +
+  geom_line(aes(x=date,y=gpp_pred,color="pred",alpha =0.5)) +
+  theme(legend.position = "none")
+  
+  plot_calibrated_le <- ggplot(plot_calibrated) +
+  geom_line(aes(x=date,y=le_obs,color="obs",alpha =0.5)) +
+  geom_line(aes(x=date,y=le_pred,color="pred",alpha =0.5)) +
+  theme(legend.position = "none")
+  
+  assign(paste0("plot_gpp_",i),plot_calibrated_gpp)
+  
+  assign(paste0("plot_le_",i),plot_calibrated_le)
+}
+```
+
+```{r}
+# GPP plot
+
+plot_list <- mget(ls(pattern = "^plot_gpp_"))
+
+plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
+```
+
+```{r}
+# le plot
+
+plot_list <- mget(ls(pattern = "^plot_le_"))
+
+plot_grid(plot_grid(plotlist = plot_list,ncol = 3))
+```
