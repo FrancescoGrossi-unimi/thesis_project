@@ -1,3 +1,12 @@
+
+---
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{P-model usage}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\usepackage[utf8]{inputenc}
+---
+
 ```{r}
 # library and data loading
 library(rsofun)
@@ -5,15 +14,138 @@ library(dplyr)
 library(tidyr)
 library(ggplot2)
 library(readr)
+library(cowplot)
 
 driver <- read_rds("/data_2/FluxDataKit/v3.4/zenodo_upload/rsofun_driver_data_v3.4.rds") # currently only on workstation
 
+
+plot_eval <- function(df, is_gpp = TRUE, return_gg1 = FALSE, return_gg2 = FALSE){
+  
+  use_col <- ifelse(is_gpp, "tomato", "royalblue")
+  use_lab <- ifelse(
+    is_gpp,
+    expression(paste("GPP (g C m"^-2, "s"^-1, ")")), 
+    expression(paste("LE (W m"^-2, ")"))
+    )
+  use_lab_obs <- ifelse(
+    is_gpp,
+    expression(paste("Observed GPP (g C m"^-2, "s"^-1, ")")), 
+    expression(paste("Observed LE (W m"^-2, ")"))
+    )
+  use_lab_mod <- ifelse(
+    is_gpp,
+    expression(paste("Modeled GPP (g C m"^-2, "s"^-1, ")")), 
+    expression(paste("Modeled LE (W m"^-2, ")"))
+    )
+  lims <- ifelse(
+    is_gpp,
+    c(-0.5, 10),
+    c(-20, 175)
+  )
+   
+  # Plot GPP observed and modelled quartiles by day-of-year
+  gg1 <- df |> 
+    tidyr::pivot_longer(c(mod, obs), names_to = "type", values_to = "var") |> 
+    mutate(doy = lubridate::yday(date)) |> 
+    group_by(doy, type) |> 
+    summarise(
+      var_q25 = quantile(var, probs = c(0.25), na.rm = TRUE),
+      var_q75 = quantile(var, probs = c(0.75), na.rm = TRUE)
+      ) |> 
+    ggplot() +
+    geom_ribbon(
+      aes(
+        x = doy,
+        ymin = var_q25,
+        ymax = var_q75,
+        fill = type
+        ),
+      alpha = 0.75
+    ) +
+    scale_fill_manual(
+      name = "",
+      values = c(
+        "mod" = use_col,
+        "obs" = 'grey20'
+        ),
+      labels = c(
+        "mod" = "Mod.",
+        "obs" = "Obs."
+      )) +
+    theme_classic() +
+    theme() +
+    labs(
+      x = 'Date',
+      y = use_lab,
+      colour = ""
+    )
+  
+  # get fit metrics
+  rsq_val <- yardstick::rsq(df, mod, obs) |> pull(.estimate)
+  rmse_val <- yardstick::rmse(df, mod, obs) |> pull(.estimate)
+  bias_val <- mean(df$mod - df$obs, na.rm = TRUE)
+  linmod <- lm(obs ~ mod + 0, data = df)
+  slope_val <- coef(linmod)
+  n_val <- df |> tidyr::drop_na() |> nrow()
+  
+  rsq_lab <- format(rsq_val, digits = 3)
+  rmse_lab <- format(rmse_val, digits = 3)
+  bias_lab <- format(bias_val, digits = 3)
+  slope_lab <- format(slope_val, digits = 3)
+  n_lab <- n_val
+  
+  subtitle <- bquote(italic(R)^2 == .(rsq_lab) ~ ~
+                    RMSE == .(rmse_lab) ~ ~
+                    bias == .(bias_lab) ~ ~
+                    slope == .(slope_lab) ~ ~
+                    italic(N) == .(n_lab))
+  
+  # plot modelled vs. observed (actually the reverse)
+  gg2 <- df |> 
+    ggplot(aes(x = mod, y = obs)) +
+    geom_hex(bins = 50, show.legend = FALSE) +
+    theme_classic() +
+    geom_abline(intercept = 0, slope = 1, linetype = "dotted") +
+    geom_hline(yintercept = 0, linetype = "dotted") +
+    geom_vline(xintercept = 0, linetype = "dotted")+ 
+    geom_smooth(method = "lm", formula = y ~ x + 0, color = "red", size = 0.5, se = FALSE) +
+    xlim(lims[1], lims[2]) + 
+    ylim(lims[1], lims[2]) +
+    labs(
+      x = use_lab_mod,
+      y = use_lab_obs,
+      subtitle = subtitle
+    )
+  
+  if (is_gpp){
+    gg2 <- gg2 +
+      khroma::scale_fill_batlowW(trans = "log", reverse = TRUE)
+  } else {
+    gg2 <- gg2 +
+      khroma::scale_fill_davos(trans = "log", reverse = TRUE)
+
+  }
+  
+  if (return_gg1){
+    return(gg1)
+  } else if (return_gg2){
+    return(gg2)
+  } else {
+    cow <- cowplot::plot_grid(gg1, gg2, nrow = 1)
+    return(cow)
+  }
+}
 ```
+
+## Scope
+
+In this Vignette I'll modified the cost function used in 'calib_sofun' to calibrate the parameters using only the daily gpp and / or le value with a quality flag higher than 0.8. each modification of the original function are indicated with the comment "MODIFIED"
+
 
 ```{r}
 # modfied RMSE cost function
 
-# !!! comment with  MODIFIED is where I add the filter
+# !!! comment with  MODIFIED is where I modify the function
 modified_cost_rmse_pmodel <- function(
     par,  # ordered vector of model parameters
     obs, 
@@ -185,12 +317,15 @@ modified_cost_rmse_pmodel <- function(
 
 ```
 
+
+I'll use the site FR-Pue. I'll run the simulation using the Penmann-Montheith equation using non-calibrated and calibrated parameter
+
 ```{r}
 # I select the site US-SRG beacuse show the highest gpp qc
 
-us_srg <- driver[driver$sitename == "US-SRG",]
+single_site <- driver[driver$sitename == "FR-Pue",]
 
-us_srg <- us_srg |> unnest(params_siml) |>
+single_site <- single_site |> unnest(params_siml) |>
   mutate(use_gs = TRUE,
          use_phydro = FALSE,
          use_pml= TRUE) |>
@@ -200,7 +335,9 @@ us_srg <- us_srg |> unnest(params_siml) |>
 
 ```
 
-```{r}
+## Run with non-calibrated parameter
+
+```{r, fig.width=8, fig.height=4}
 # P model run and plot WITHOUT calibration
 params_modl <- list(
   kphio              = 0.04998,    # setup ORG in Stocker et al. 2020 GMD
@@ -213,22 +350,28 @@ params_modl <- list(
   kc_jmax            = 0.41
 )
 
-out_non_calibrated <- runread_pmodel_f(
-  us_srg,
+output <- runread_pmodel_f(
+  single_site,
   par = params_modl
 )
 
-plot_non_calibrated <- us_srg |> unnest(forcing) |>
-    select(date,gpp) |>
-    rename(gpp_obs = gpp)
-  
-plot_non_calibrated$gpp_pred <- out_non_calibrated[[3]][[1]]$gpp
+df_plot <- output |>
+  unnest(data) |>
+  select(date, mod = gpp) |> 
+  left_join(
+    single_site |>
+      unnest(forcing) |> 
+      select(date, obs = gpp),
+    by = join_by(date)
+  )
 
-ggplot(plot_non_calibrated) +
-  geom_line(aes(x=date,y=gpp_obs,color="obs")) +
-  geom_line(aes(x=date,y=gpp_pred,color="pred"))
+plot_eval(df_plot)
 ```
 
+
+## Calibration using GenSa
+
+I keep 1000 iterations to allow a fast check
 
 ```{r}
 # calibration
@@ -237,7 +380,7 @@ settings <- list(
   method              = "GenSA",
   metric              = modified_cost_rmse_pmodel,
   control = list(
-    maxit = 100),
+    maxit = 1000),
   par = list(
     kphio = list(lower=0.03, upper=0.2, init = 0.05),
     kphio_par_a = list(lower = -0.0004, upper = 0.001, init = -0.0025),
@@ -246,7 +389,7 @@ settings <- list(
   )
 )
 
-evaluation <- us_srg |>
+evaluation <- single_site |>
   unnest(forcing) |>
   select(sitename,date,gpp,gpp_qc) |>
   group_by(sitename) |>
@@ -254,7 +397,7 @@ evaluation <- us_srg |>
 
 
 pars <- calib_sofun(
-  drivers = us_srg,
+  drivers = single_site,
   obs = evaluation,
   settings = settings,
   targets = "gpp",
@@ -268,32 +411,31 @@ pars <- calib_sofun(
 
 ```
 
-```{r}
+```{r, fig.width=8, fig.height=4}
 # P model run and plot WITH calibration
 params_modl <- list(
-  kphio              = pars$par[["kphio"]],   
-  kphio_par_a        = pars$par[["kphio_par_a"]],       
+  kphio              = pars$par[["kphio"]],
+  kphio_par_a        = pars$par[["kphio_par_a"]],
   kphio_par_b        = pars$par[["kphio_par_b"]],
-  rd_to_vcmax        = 0.014,  
-  soilm_thetastar    = pars$par[["soilm_thetastar"]], 
+  rd_to_vcmax        = 0.014,
+  soilm_thetastar    = pars$par[["soilm_thetastar"]],
   beta_unitcostratio = 146,
   tau_acclim         = 30,
   kc_jmax            = 0.54131889
 )
 
-out_calibrated <- runread_pmodel_f(
-  us_srg,
-  par = params_modl
-)
+df_plot <- output |>
+  unnest(data) |>
+  select(date, mod = gpp) |> 
+  left_join(
+    single_site |>
+      unnest(forcing) |> 
+      select(date, obs = gpp),
+    by = join_by(date)
+  )
 
-plot_calibrated <- us_srg |> unnest(forcing) |>
-  select(date,gpp) |>
-  rename(gpp_obs = gpp)
-
-plot_calibrated$gpp_pred <- out_calibrated[[3]][[1]]$gpp
-
-ggplot(plot_calibrated) +
-  geom_line(aes(x=date,y=gpp_obs,color="obs")) +
-  geom_line(aes(x=date,y=gpp_pred,color="pred"))
+plot_eval(df_plot)
 
 ```
+
+There is an improvement in GPP simulation after the calibration
