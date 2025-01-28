@@ -1,10 +1,10 @@
 
 ---
-output: rmarkdown::html_vignette
-vignette: >
-  %\VignetteIndexEntry{P-model usage}
-  %\VignetteEngine{knitr::rmarkdown}
-  %\usepackage[utf8]{inputenc}
+output:
+  html_document:
+    df_print: paged
+vignette: "%\\VignetteIndexEntry{P-model usage} %\\VignetteEngine{knitr::rmarkdown}
+  %\\usepackage[utf8]{inputenc}\n"
 ---
 
 ```{r}
@@ -325,107 +325,69 @@ single_site <- single_site |> unnest(params_siml) |>
 single_site$site_info[[1]]$whc <- 255
 ```
 
-## Run with non-calibrated parameter
 
+## Calibration 
 
-```{r, fig.width=8, fig.height=4}
-params_modl <- list(
-  kphio              = 0.04998,    # setup ORG in Stocker et al. 2020 GMD
-  kphio_par_a        = 0.0,        # set to zero to disable temperature-dependence of kphio
-  kphio_par_b        = 1.0,
-  soilm_thetastar    = 0.6 * 240,  # to recover old setup with soil moisture stress
-  beta_unitcostratio = 146.0,
-  rd_to_vcmax        = 0.014,      # value from Atkin et al. 2015 for C3 herbaceous
-  tau_acclim         = 30.0,
-  kc_jmax            = 0.41
-)
-
-output <- runread_pmodel_f(
-  single_site,
-  par = params_modl
-)
-
-df_plot <- output |>
-  unnest(data) |>
-  select(date, mod = gpp) |> 
-  left_join(
-    single_site |>
-      unnest(forcing) |> 
-      select(date, obs = gpp),
-    by = join_by(date)
-  )
-
-plot_eval(df_plot)
-```
-
-### Le results
-
-```{r, fig.width=8, fig.height=4}
-
-df_plot <- output |>
-  unnest(data) |>
-  mutate(le =  le / (24 * 60 * 60)) |> 
-  select(date, mod = le) |> 
-  left_join(
-    p_model_validation |>
-      unnest(data) |> 
-      select(date, obs = le),
-    by = join_by(date)
-  )
-
-plot_eval(df_plot, is_gpp = FALSE)
-```
-
-## Calibration DO NOT RUN
-
+approx. 30 min
 
 ```{r}
 # LE and GPP calibration
 
-# evaluation <- single_site |>
-#   unnest(forcing) |>
-#   select(sitename,date,gpp,gpp_qc,le,le_qc) |>
-#   group_by(sitename) |>
-#   nest(data = c(date,gpp,gpp_qc,le,le_qc))
-# 
-# params_fix <- list(
-#   rd_to_vcmax        = 0.014,
-#   tau_acclim         = 30)
-# 
-# # Define calibration settings
-# settings <- list(
-#   method = "BayesianTools",
-#   par = list(
-#     kphio = list(lower=0.03, upper=0.2, init = 0.05),
-#     kphio_par_a = list(lower = -0.0004, upper = 0.001, init = -0.0025),
-#     kphio_par_b = list(lower = 10, upper = 30, init = 20),
-#     soilm_thetastar = list(lower  = 0, upper = 240, init = 144),
-#     beta_unitcostratio = list(lower = 5, upper = 200, init= 50),
-#     kc_jmax            =  list(lower = 0.2, upper = 0.8, init = 0.41),      
-#     err_gpp = list(lower = 0.01, upper = 4, init = 2),
-#     err_le = list(lower = 0.01, upper = 170, init = 38)
-#   ),
-#   metric = modified_cost_likelihood_pmodel,
-#   control = list(
-#     sampler = "DEzs",
-#     settings = list(
-#       nrChains = 20,
-#       burnin = 0,
-#       iterations = 5000    # kept artificially low,
-#     )
-#   )
-# )
-# 
-# # Run the calibration for GPP data
-# calib_output <- rsofun::calib_sofun(
-#   drivers = single_site,
-#   obs = evaluation,
-#   settings = settings,
-#   # extra arguments for the cost function
-#   par_fixed = params_fix,
-#   targets = c("gpp","le")
-# )
+evaluation <- single_site |>
+  unnest(forcing) |>
+  dplyr::select(sitename,date,gpp,gpp_qc,le,le_qc) |>
+  group_by(sitename) |>
+  nest(data = c(date,gpp,gpp_qc,le,le_qc))
+
+params_fix <- list(
+  rd_to_vcmax        = 0.014,
+  tau_acclim         = 30)
+
+settings <- list(
+  method = "BayesianTools",
+  par = list(
+    kphio = list(lower=0.03, upper=0.2, init = 0.05),
+    kphio_par_a = list(lower = -0.0004, upper = 0.000001, init = -0.0025),
+    kphio_par_b = list(lower = 10, upper = 30, init = 20),
+    soilm_thetastar = list(lower  = 0, upper = 240, init = 144),
+    beta_unitcostratio = list(lower = 5, upper = 200, init= 50),
+    kc_jmax            =  list(lower = 0.2, upper = 0.8, init = 0.41),
+    gw_calib = list(lower = 0.5, upper = 10, init = 2),
+    err_gpp = list(lower = 0.01, upper = 4, init = 2),
+    err_le = list(lower = 0.01, upper = 170, init = 38)
+  ),
+  metric = modified_cost_likelihood_pmodel,
+  control = list(
+    sampler = "DEzs",
+    settings = list(
+      burnin = 5000,
+      iterations = 20000,
+      nrChains = 3,        # number of independent chains
+      startValue = 3    # kept artificially low,
+    )
+  )
+)
+
+# Run the calibration for GPP and le 
+calib_output <- rsofun::calib_sofun(
+  drivers = single_site,
+  obs = evaluation,
+  settings = settings,
+  # extra arguments for the cost function
+  par_fixed = params_fix,
+  targets = c("gpp",  "le")
+)
+
 ```
+
+## Calibration results
+
+```{r, fig.height=10, fig.width= 16}
+plot(calib_output$mod)
+
+```
+
+
 
 ## Run with calibrated parameter
 
@@ -434,21 +396,24 @@ I run the calibration separately and insert manually the results
 
 ```{r, fig.width=8, fig.height=4}
 params_modl <- list(
-  kphio              =  0.0327384,      #calib_output$par[["kphio"]],   
-  kphio_par_a        =  -0.0003941861,  #calib_output$par[["kphio_par_a"]],       
-  kphio_par_b        =  16.02987,       #calib_output$par[["kphio_par_b"]],
+  kphio              =  calib_output$par[["kphio"]],   
+  kphio_par_a        =  calib_output$par[["kphio_par_a"]],       
+  kphio_par_b        =  calib_output$par[["kphio_par_b"]],       
   rd_to_vcmax        =  0.014,  
-  soilm_thetastar    =  237.5103,       #calib_output$par[["soilm_thetastar"]], 
-  beta_unitcostratio =  186.3469,       #calib_output$par[["beta_unitcostratio"]],
+  soilm_thetastar    =  calib_output$par[["soilm_thetastar"]],       
+  beta_unitcostratio =  calib_output$par[["beta_unitcostratio"]],       
   tau_acclim         =  30,
-  kc_jmax            =  0.3843257       #calib_output$par[["kc_jmax"]]
+  kc_jmax            =  calib_output$par[["kc_jmax"]],
+  gw_calib = calib_output$par[["gw_calib"]]#calib_output$par[["kc_jmax"]]
 )
 
 
-output <- runread_pmodel_f(
+
+output <- rsofun::runread_pmodel_f(
   single_site,
   par = params_modl
 )
+
 
 df_plot <- output |>
   unnest(data) |>
@@ -470,43 +435,6 @@ The GPP prediction are very good, however the LE prediction are worse using the 
 ### LE results
 
 ```{r, fig.width=8, fig.height=4}
-
-df_plot <- output |>
-  unnest(data) |>
-  mutate(le =  le / (24 * 60 * 60)) |> 
-  select(date, mod = le) |> 
-  left_join(
-    p_model_validation |>
-      unnest(data) |> 
-      select(date, obs = le),
-    by = join_by(date)
-  )
-
-plot_eval(df_plot, is_gpp = FALSE)
-```
-
-LE is underestimated compared to previous results, if I increase largely the k_phio to 0.09
-LE is correctly simulated
-
-
-```{r, fig.width=8, fig.height=4}
-
-params_modl <- list(
-  kphio              =  0.09,   
-  kphio_par_a        =  -0.0003941861,  #calib_output$par[["kphio_par_a"]],       
-  kphio_par_b        =  16.02987,       #calib_output$par[["kphio_par_b"]],
-  rd_to_vcmax        =  0.014,  
-  soilm_thetastar    =  237.5103,       #calib_output$par[["soilm_thetastar"]], 
-  beta_unitcostratio =  186.3469,       #calib_output$par[["beta_unitcostratio"]],
-  tau_acclim         =  30,
-  kc_jmax            =  0.3843257       #calib_output$par[["kc_jmax"]]
-)
-
-
-output <- runread_pmodel_f(
-  single_site,
-  par = params_modl
-)
 
 df_plot <- output |>
   unnest(data) |>
